@@ -1,0 +1,8 @@
+{
+  "name": "MeshMeet P2P",
+  "description": "A serverless-style peer-to-peer video calling application using WebRTC mesh networking.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

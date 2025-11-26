@@ -1,0 +1,353 @@
+
+
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { signaling } from '../services/socket';
+import { ConnectionStats } from '../types';
+
+const STUN_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' }
+  ],
+};
+
+interface RoomConfig {
+  isPublic: boolean;
+  name: string;
+}
+
+export const useWebRTC = (roomId: string, userId: string, userName: string, localStream: MediaStream | null, isScreenShare: boolean, config?: RoomConfig) => {
+  const [peers, setPeers] = useState<Map<string, RTCPeerConnection>>(new Map());
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
+  const [connectionStats, setConnectionStats] = useState<Map<string, ConnectionStats>>(new Map());
+  const [peerNames, setPeerNames] = useState<Map<string, string>>(new Map());
+  const [peerScreenShares, setPeerScreenShares] = useState<Map<string, boolean>>(new Map());
+  
+  const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const isScreenShareRef = useRef<boolean>(isScreenShare);
+  
+  // Store previous stats to calculate deltas (loss percentage)
+  const prevStatsRef = useRef<Map<string, { packetsLost: number, packetsReceived: number }>>(new Map());
+
+  // Update ref when isScreenShare changes
+  useEffect(() => {
+    isScreenShareRef.current = isScreenShare;
+  }, [isScreenShare]);
+
+  // Handle stream switching (e.g. Camera -> Screen Share)
+  useEffect(() => {
+    if (localStream && localStreamRef.current && localStream.id !== localStreamRef.current.id) {
+        // Stream changed, we need to replace tracks in existing connections
+        const videoTrack = localStream.getVideoTracks()[0];
+        const audioTrack = localStream.getAudioTracks()[0];
+
+        peersRef.current.forEach(async (pc, peerId) => {
+            const senders = pc.getSenders();
+            const videoSender = senders.find(s => s.track?.kind === 'video');
+            const audioSender = senders.find(s => s.track?.kind === 'audio');
+            
+            if (videoSender && videoTrack) {
+                try {
+                    await videoSender.replaceTrack(videoTrack);
+                } catch (err) {
+                    console.error('Error replacing video track', err);
+                }
+            }
+            if (audioSender && audioTrack) {
+                try {
+                    await audioSender.replaceTrack(audioTrack);
+                } catch (err) {
+                    console.error('Error replacing audio track', err);
+                }
+            }
+            
+            // Re-negotiate metadata (resolution/type) if needed by sending a new offer (optional, but handled via signaling here)
+            // For simple switching, we just replace track. The peer will see resolution change naturally.
+            // But we want to update the "isScreenShare" status on peer side.
+            // We can re-offer
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            signaling.emit('offer', {
+                targetUserId: peerId,
+                userName: userName,
+                isScreenShare: isScreenShare,
+                offer: offer
+            });
+        });
+    }
+    localStreamRef.current = localStream;
+  }, [localStream, isScreenShare, userName]);
+
+  // Periodic Stats Gathering
+  useEffect(() => {
+    const interval = setInterval(async () => {
+        if (peersRef.current.size === 0) return;
+
+        const nextStats = new Map<string, ConnectionStats>();
+
+        for (const [peerId, pc] of peersRef.current) {
+            try {
+                const stats = await pc.getStats();
+                let rtt = 0;
+                let jitter = 0;
+                let cumulativeLoss = 0;
+                let cumulativeReceived = 0;
+                let resolution = '';
+                let frameRate = 0;
+
+                stats.forEach(report => {
+                    // Check for active candidate pair to get RTT
+                    if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                        // currentRoundTripTime is in seconds
+                        rtt = report.currentRoundTripTime ? report.currentRoundTripTime * 1000 : 0;
+                    }
+                    // Check inbound-rtp for video stats (jitter/loss)
+                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                        jitter = report.jitter ? report.jitter * 1000 : 0;
+                        cumulativeLoss = report.packetsLost || 0;
+                        cumulativeReceived = report.packetsReceived || 0;
+                        
+                        if (report.frameWidth && report.frameHeight) {
+                            resolution = `${report.frameWidth}x${report.frameHeight}`;
+                        }
+                        if (report.framesPerSecond) {
+                            frameRate = Math.round(report.framesPerSecond);
+                        }
+                    }
+                });
+
+                // Calculate Loss Percentage based on delta from previous interval
+                const prev = prevStatsRef.current.get(peerId) || { packetsLost: 0, packetsReceived: 0 };
+                
+                const deltaLost = cumulativeLoss - prev.packetsLost;
+                const deltaReceived = cumulativeReceived - prev.packetsReceived;
+                const totalPackets = deltaLost + deltaReceived;
+                
+                let lossPercentage = 0;
+                if (totalPackets > 0) {
+                    lossPercentage = (deltaLost / totalPackets) * 100;
+                }
+
+                // Update previous stats
+                prevStatsRef.current.set(peerId, { packetsLost: cumulativeLoss, packetsReceived: cumulativeReceived });
+
+                nextStats.set(peerId, { 
+                    rtt, 
+                    jitter, 
+                    packetsLost: cumulativeLoss,
+                    packetLossPercentage: lossPercentage,
+                    resolution,
+                    frameRate
+                });
+            } catch (e) {
+                console.warn(`Failed to get stats for peer ${peerId}`, e);
+            }
+        }
+        setConnectionStats(nextStats);
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  const createPeerConnection = useCallback((targetUserId: string, initiator: boolean) => {
+    if (peersRef.current.has(targetUserId)) {
+        console.warn(`Peer connection already exists for ${targetUserId}`);
+        return peersRef.current.get(targetUserId);
+    }
+
+    const pc = new RTCPeerConnection(STUN_SERVERS);
+    
+    // Add local tracks
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        if (localStreamRef.current) {
+            pc.addTrack(track, localStreamRef.current);
+        }
+      });
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        signaling.emit('ice-candidate', {
+          targetUserId: targetUserId,
+          candidate: event.candidate,
+        });
+      }
+    };
+
+    pc.ontrack = (event) => {
+      const [remoteStream] = event.streams;
+      setRemoteStreams((prev) => {
+        const newMap = new Map(prev);
+        newMap.set(targetUserId, remoteStream);
+        return newMap;
+      });
+    };
+
+    peersRef.current.set(targetUserId, pc);
+    setPeers(new Map(peersRef.current));
+
+    return pc;
+  }, []);
+
+  const handleUserConnected = useCallback(async (newUserId: string) => {
+    console.log('User connected:', newUserId);
+    const pc = createPeerConnection(newUserId, true);
+    if (pc) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        signaling.emit('offer', {
+            targetUserId: newUserId,
+            userName: userName,
+            isScreenShare: isScreenShareRef.current,
+            offer: offer
+        });
+    }
+  }, [createPeerConnection, userName]);
+
+  const handleOffer = useCallback(async (callerId: string, callerName: string, isScreenShareRemote: boolean, offer: RTCSessionDescriptionInit) => {
+    console.log(`Received offer from ${callerId} (${callerName})`);
+    
+    setPeerNames(prev => {
+        const newMap = new Map(prev);
+        newMap.set(callerId, callerName);
+        return newMap;
+    });
+    
+    setPeerScreenShares(prev => {
+        const newMap = new Map(prev);
+        newMap.set(callerId, isScreenShareRemote);
+        return newMap;
+    });
+
+    const pc = createPeerConnection(callerId, false);
+    if (pc) {
+        // If we already have a connection, setRemoteDescription works for renegotiation too
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        signaling.emit('answer', {
+            targetUserId: callerId,
+            userName: userName,
+            isScreenShare: isScreenShareRef.current,
+            answer: answer
+        });
+    }
+  }, [createPeerConnection, userName]);
+
+  const handleAnswer = useCallback(async (callerId: string, callerName: string, isScreenShareRemote: boolean, answer: RTCSessionDescriptionInit) => {
+    console.log(`Received answer from ${callerId} (${callerName})`);
+    
+    setPeerNames(prev => {
+        const newMap = new Map(prev);
+        newMap.set(callerId, callerName);
+        return newMap;
+    });
+
+    setPeerScreenShares(prev => {
+        const newMap = new Map(prev);
+        newMap.set(callerId, isScreenShareRemote);
+        return newMap;
+    });
+
+    const pc = peersRef.current.get(callerId);
+    if (pc) {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    }
+  }, []);
+
+  const handleIceCandidate = useCallback(async (callerId: string, candidate: RTCIceCandidateInit) => {
+    const pc = peersRef.current.get(callerId);
+    if (pc) {
+        try {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (e) {
+            console.error('Error adding received ice candidate', e);
+        }
+    }
+  }, []);
+
+  const handleUserDisconnected = useCallback((disconnectedUserId: string) => {
+    console.log('User disconnected:', disconnectedUserId);
+    const pc = peersRef.current.get(disconnectedUserId);
+    if (pc) {
+        pc.close();
+        peersRef.current.delete(disconnectedUserId);
+        setPeers(new Map(peersRef.current));
+        
+        setRemoteStreams((prev) => {
+            const newMap = new Map(prev);
+            newMap.delete(disconnectedUserId);
+            return newMap;
+        });
+        
+        setConnectionStats(prev => {
+            const newStats = new Map(prev);
+            newStats.delete(disconnectedUserId);
+            return newStats;
+        });
+
+        setPeerNames(prev => {
+            const newMap = new Map(prev);
+            newMap.delete(disconnectedUserId);
+            return newMap;
+        });
+
+        setPeerScreenShares(prev => {
+            const newMap = new Map(prev);
+            newMap.delete(disconnectedUserId);
+            return newMap;
+        });
+        
+        prevStatsRef.current.delete(disconnectedUserId);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!roomId || !userId) return; // Wait for room join
+
+    signaling.connect(userId);
+    // Pass config if available
+    signaling.emit('join-room', roomId, userId, config);
+
+    signaling.on('user-connected', (data: any) => {
+        const targetId = typeof data === 'string' ? data : data.senderId;
+        if(targetId && targetId !== userId) handleUserConnected(targetId);
+    });
+
+    signaling.on('offer', (payload: any) => {
+        if (payload.targetUserId === userId || payload.targetUserId === 'all') {
+             handleOffer(payload.callerId, payload.userName, payload.isScreenShare, payload.offer);
+        }
+    });
+
+    signaling.on('answer', (payload: any) => {
+        if (payload.targetUserId === userId) {
+            handleAnswer(payload.callerId, payload.userName, payload.isScreenShare, payload.answer);
+        }
+    });
+
+    signaling.on('ice-candidate', (payload: any) => {
+        if (payload.targetUserId === userId) {
+            handleIceCandidate(payload.callerId, payload.candidate);
+        }
+    });
+
+    signaling.on('user-disconnected', (id: string) => handleUserDisconnected(id));
+
+    return () => {
+      signaling.off('user-connected');
+      signaling.off('offer');
+      signaling.off('answer');
+      signaling.off('ice-candidate');
+      signaling.off('user-disconnected');
+      
+      peersRef.current.forEach(pc => pc.close());
+      peersRef.current.clear();
+      prevStatsRef.current.clear();
+    };
+  }, [roomId, userId, handleUserConnected, handleOffer, handleAnswer, handleIceCandidate, handleUserDisconnected]);
+
+  return { remoteStreams, connectionStats, peerNames, peerScreenShares };
+};
