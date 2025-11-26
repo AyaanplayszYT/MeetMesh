@@ -327,31 +327,80 @@ const VideoGrid: React.FC<VideoGridProps> = ({
   
   const count = streams.length;
   const isCompact = count > 9;
+  
+  // Check if anyone is screen sharing
+  const screenShareStream = streams.find(s => s.isScreenShare);
+  const hasScreenShare = !!screenShareStream;
 
   // Calculates the optimal CSS Grid classes based on participant count
   const getLayoutConfig = (n: number) => {
     // Base (Mobile) -> MD (Tablet/Desktop)
-    if (n === 1) return 'grid-cols-1 max-w-4xl';
-    if (n === 2) return 'grid-cols-1 md:grid-cols-2 max-w-5xl'; 
-    if (n <= 4) return 'grid-cols-2 max-w-6xl';
-    if (n <= 6) return 'grid-cols-2 md:grid-cols-3 max-w-[1400px]';
-    if (n <= 9) return 'grid-cols-3 max-w-[1600px]';
-    if (n <= 12) return 'grid-cols-3 md:grid-cols-4 max-w-full';
-    if (n <= 16) return 'grid-cols-4 max-w-full';
-    return 'grid-cols-4 md:grid-cols-5 max-w-full';
+    if (n === 1) return 'grid-cols-1';
+    if (n === 2) return 'grid-cols-1 md:grid-cols-2'; 
+    if (n <= 4) return 'grid-cols-2';
+    if (n <= 6) return 'grid-cols-2 md:grid-cols-3';
+    if (n <= 9) return 'grid-cols-3';
+    if (n <= 12) return 'grid-cols-3 md:grid-cols-4';
+    if (n <= 16) return 'grid-cols-4';
+    return 'grid-cols-4 md:grid-cols-5';
   };
 
+  // Screen share layout: presenter takes main area, others in sidebar
+  if (hasScreenShare && count > 1) {
+    const otherStreams = streams.filter(s => s.id !== screenShareStream.id);
+    
+    return (
+      <div className="w-full h-full p-2 md:p-4 flex flex-col md:flex-row gap-2 md:gap-4 overflow-hidden">
+        {/* Main screen share area */}
+        <div className="flex-1 min-h-0 min-w-0 flex items-center justify-center">
+          <div className="w-full h-full max-h-full">
+            <VideoTile 
+              stream={screenShareStream.stream} 
+              isLocal={screenShareStream.isLocal} 
+              userId={screenShareStream.id} 
+              userName={screenShareStream.userName}
+              stats={screenShareStream.stats}
+              muted={screenShareStream.stream.getAudioTracks()[0]?.enabled === false}
+              isCompact={false}
+              caption={captions?.get(screenShareStream.id)}
+              isScreenShare={true}
+            />
+          </div>
+        </div>
+        
+        {/* Sidebar with other participants */}
+        <div className="flex md:flex-col gap-2 md:w-48 lg:w-56 xl:w-64 overflow-x-auto md:overflow-y-auto md:overflow-x-hidden shrink-0">
+          {otherStreams.map(p => (
+            <div key={p.id} className="w-32 h-24 md:w-full md:h-auto md:aspect-video shrink-0">
+              <VideoTile 
+                stream={p.stream} 
+                isLocal={p.isLocal} 
+                userId={p.id} 
+                userName={p.userName}
+                stats={p.stats}
+                muted={p.stream.getAudioTracks()[0]?.enabled === false}
+                isCompact={true}
+                caption={captions?.get(p.id)}
+                isScreenShare={p.isScreenShare}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // Standard grid layout (no screen share)
   return (
     <div className="w-full h-full p-2 md:p-4 flex items-center justify-center overflow-hidden">
        <div 
-          className={`grid ${count > 12 ? 'gap-2' : 'gap-3 md:gap-4'} w-full h-full transition-all duration-500 ease-in-out place-content-center ${getLayoutConfig(count)}`}
+          className={`grid ${count > 12 ? 'gap-2' : 'gap-3 md:gap-4'} w-full h-full transition-all duration-500 ease-in-out ${getLayoutConfig(count)}`}
           style={{
-             // Ensure rows take equal height, but don't stretch excessively if there are few
-             gridAutoRows: count <= 2 ? 'minmax(0, 1fr)' : 'minmax(0, 1fr)'
+             maxWidth: count === 1 ? '1000px' : count === 2 ? '1200px' : count <= 4 ? '1400px' : '100%',
           }}
        >
           {streams.map(p => (
-            <div key={p.id} className="w-full h-full min-h-0 flex justify-center">
+            <div key={p.id} className="w-full aspect-video min-h-0">
                 <VideoTile 
                     stream={p.stream} 
                     isLocal={p.isLocal} 

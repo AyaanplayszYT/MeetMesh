@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Video, Plus, ArrowRight, Loader2, Sparkles, Keyboard, ShieldCheck, Mic, MicOff, Video as VideoIcon, VideoOff, Users, Globe, Lock, RotateCcw, Home, Copyright, User as UserIcon, Wifi, WifiOff } from 'lucide-react';
+import { Video, Plus, ArrowRight, Loader2, Sparkles, Keyboard, ShieldCheck, Mic, MicOff, Video as VideoIcon, VideoOff, Users, Globe, Lock, RotateCcw, Home, Copyright, User as UserIcon, Wifi, WifiOff, DoorOpen, Check, X, Clock, Github, ScrollText } from 'lucide-react';
 import { useWebRTC } from './hooks/useWebRTC';
 import { useBackgroundBlur } from './hooks/useBackgroundBlur';
 import { useLiveCaptions } from './hooks/useLiveCaptions';
@@ -10,21 +10,28 @@ import Chat from './components/Chat';
 import Whiteboard from './components/Whiteboard';
 import SettingsModal from './components/SettingsModal';
 import { signaling } from './services/socket';
-import { RoomInfo } from './types';
+import { RoomInfo, RoomSettings, WaitingUser } from './types';
 
 const generateId = () => Math.random().toString(36).substr(2, 6);
 
 const App = () => {
   // App State
-  const [mode, setMode] = useState<'home' | 'join' | 'create' | 'preview' | 'room' | 'left'>('home');
+  const [mode, setMode] = useState<'home' | 'join' | 'create' | 'preview' | 'room' | 'left' | 'waiting' | 'denied'>('home');
   
   const [roomId, setRoomId] = useState('');
   const [roomName, setRoomName] = useState('');
   const [isPublic, setIsPublic] = useState(false);
+  const [waitingRoomEnabled, setWaitingRoomEnabled] = useState(false);
   
   const [userId, setUserId] = useState('');
   const [username, setUsername] = useState('');
   const [isConnected, setIsConnected] = useState(false);
+  
+  // Host & Room Settings State
+  const [isHost, setIsHost] = useState(false);
+  const [roomSettings, setRoomSettings] = useState<RoomSettings>({ isLocked: false, waitingRoom: false });
+  const [waitingUsers, setWaitingUsers] = useState<WaitingUser[]>([]);
+  const [showHostControls, setShowHostControls] = useState(false);
   
   // Media State
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -73,6 +80,49 @@ const App = () => {
       setPublicRooms(rooms);
     });
     
+    // Waiting room & host events
+    signaling.on('room-joined', (payload: { roomId: string; isHost: boolean; settings: RoomSettings }) => {
+      setIsHost(payload.isHost);
+      setRoomSettings(payload.settings);
+      setMode('room');
+    });
+    
+    signaling.on('room-locked', () => {
+      setError('This room is locked. You cannot join.');
+      setMode('home');
+    });
+    
+    signaling.on('waiting-room', () => {
+      setMode('waiting');
+    });
+    
+    signaling.on('admitted', (payload: { roomId: string; isHost: boolean; settings: RoomSettings }) => {
+      setIsHost(payload.isHost);
+      setRoomSettings(payload.settings);
+      setMode('room');
+    });
+    
+    signaling.on('denied', () => {
+      setMode('denied');
+    });
+    
+    signaling.on('waiting-room-update', (payload: { roomId: string; waitingUsers: WaitingUser[] }) => {
+      setWaitingUsers(payload.waitingUsers);
+    });
+    
+    signaling.on('room-settings-update', (settings: RoomSettings) => {
+      setRoomSettings(settings);
+    });
+    
+    signaling.on('host-changed', (payload: { isHost: boolean }) => {
+      setIsHost(payload.isHost);
+    });
+    
+    signaling.on('room-closed', () => {
+      setError('The room has been closed by the host.');
+      setMode('home');
+    });
+    
     // Periodic refresh of rooms
     const interval = setInterval(() => {
         // Only request if connected to avoid queue buildup if offline
@@ -85,6 +135,15 @@ const App = () => {
       signaling.off('connect', onConnect);
       signaling.off('disconnect', onDisconnect);
       signaling.off('rooms-update');
+      signaling.off('room-joined');
+      signaling.off('room-locked');
+      signaling.off('waiting-room');
+      signaling.off('admitted');
+      signaling.off('denied');
+      signaling.off('waiting-room-update');
+      signaling.off('room-settings-update');
+      signaling.off('host-changed');
+      signaling.off('room-closed');
       clearInterval(interval);
     }
   }, []);
@@ -169,8 +228,28 @@ const App = () => {
 
   const handleEnterRoom = () => {
       if (localStream) {
-          setMode('room');
+          // Emit join-room with config and username - server will handle waiting room logic
+          const config = { isPublic, name: roomName, waitingRoom: waitingRoomEnabled };
+          signaling.emit('join-room', roomId, userId, config, username);
+          // Mode will be changed by room-joined or waiting-room event
       }
+  };
+  
+  // Host controls
+  const handleAdmitUser = (odId: string) => {
+    signaling.emit('admit-user', { roomId, odId });
+  };
+  
+  const handleDenyUser = (odId: string) => {
+    signaling.emit('deny-user', { roomId, odId });
+  };
+  
+  const handleToggleLock = () => {
+    signaling.emit('toggle-lock', { roomId });
+  };
+  
+  const handleToggleWaitingRoom = () => {
+    signaling.emit('toggle-waiting-room', { roomId });
   };
 
   const activeStream = useMemo(() => {
@@ -187,7 +266,7 @@ const App = () => {
     return finalStream;
   }, [screenStream, finalStream, localStream]);
 
-  const roomConfig = { isPublic, name: roomName };
+  const roomConfig = { isPublic, name: roomName, waitingRoom: waitingRoomEnabled };
   const { remoteStreams, connectionStats, peerNames, peerScreenShares } = useWebRTC(
       mode === 'room' ? roomId : '', 
       userId, 
@@ -304,7 +383,60 @@ const App = () => {
       setRoomId('');
       setRoomName('');
       setIsPublic(false);
+      setWaitingRoomEnabled(false);
+      setIsHost(false);
+      setWaitingUsers([]);
   };
+
+  // --- Render Waiting Room ---
+  if (mode === 'waiting') {
+    return (
+      <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-zinc-900/30 border border-zinc-800 rounded-3xl p-8 text-center space-y-6 backdrop-blur-xl">
+          <div className="w-20 h-20 bg-zinc-800 rounded-full flex items-center justify-center mx-auto mb-4">
+            <Clock className="w-10 h-10 text-yellow-500 animate-pulse" />
+          </div>
+          <h2 className="text-3xl font-bold text-white">Waiting Room</h2>
+          <p className="text-zinc-400">
+            Please wait for the host to let you in.
+          </p>
+          <div className="flex items-center justify-center gap-2 text-zinc-500 text-sm">
+            <div className="w-2 h-2 rounded-full bg-yellow-500 animate-pulse" />
+            Waiting for approval...
+          </div>
+          <button 
+            onClick={handleGoHome} 
+            className="w-full py-4 rounded-2xl bg-zinc-800 text-white font-medium hover:bg-zinc-700 transition-colors flex items-center justify-center gap-2"
+          >
+            <Home className="w-4 h-4" /> Leave Waiting Room
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Render Denied Screen ---
+  if (mode === 'denied') {
+    return (
+      <div className="min-h-screen bg-black flex flex-col items-center justify-center p-4">
+        <div className="max-w-md w-full bg-zinc-900/30 border border-red-900/30 rounded-3xl p-8 text-center space-y-6 backdrop-blur-xl">
+          <div className="w-20 h-20 bg-red-500/10 rounded-full flex items-center justify-center mx-auto mb-4">
+            <X className="w-10 h-10 text-red-500" />
+          </div>
+          <h2 className="text-3xl font-bold text-white">Access Denied</h2>
+          <p className="text-zinc-400">
+            The host has denied your request to join this meeting.
+          </p>
+          <button 
+            onClick={handleGoHome} 
+            className="w-full py-4 rounded-2xl bg-white text-black font-bold hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2"
+          >
+            <Home className="w-4 h-4" /> Back to Home
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // --- Render In-Room ---
   if (mode === 'room') {
@@ -316,6 +448,88 @@ const App = () => {
           isMuted={isMuted}
           isVideoStopped={isVideoStopped}
         />
+        
+        {/* Host Controls Panel */}
+        {isHost && (
+          <div className="absolute top-20 right-4 z-50">
+            <button
+              onClick={() => setShowHostControls(!showHostControls)}
+              className={`p-3 rounded-2xl transition-all ${showHostControls ? 'bg-white text-black' : 'bg-zinc-900/90 text-white border border-zinc-700'} hover:scale-105`}
+            >
+              <ShieldCheck className="w-5 h-5" />
+            </button>
+            
+            {showHostControls && (
+              <div className="absolute top-14 right-0 w-72 bg-zinc-900/95 backdrop-blur-xl border border-zinc-800 rounded-2xl p-4 space-y-4 shadow-2xl animate-in slide-in-from-top-2">
+                <div className="flex items-center gap-2 pb-3 border-b border-zinc-800">
+                  <ShieldCheck className="w-4 h-4 text-blue-400" />
+                  <span className="text-sm font-bold text-white">Host Controls</span>
+                </div>
+                
+                {/* Room Lock Toggle */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Lock className="w-4 h-4 text-zinc-400" />
+                    <span className="text-sm text-zinc-300">Lock Room</span>
+                  </div>
+                  <button
+                    onClick={handleToggleLock}
+                    className={`w-12 h-6 rounded-full transition-all ${roomSettings.isLocked ? 'bg-red-500' : 'bg-zinc-700'}`}
+                  >
+                    <div className={`w-5 h-5 rounded-full bg-white shadow transform transition-all ${roomSettings.isLocked ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                  </button>
+                </div>
+                
+                {/* Waiting Room Toggle */}
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <DoorOpen className="w-4 h-4 text-zinc-400" />
+                    <span className="text-sm text-zinc-300">Waiting Room</span>
+                  </div>
+                  <button
+                    onClick={handleToggleWaitingRoom}
+                    className={`w-12 h-6 rounded-full transition-all ${roomSettings.waitingRoom ? 'bg-green-500' : 'bg-zinc-700'}`}
+                  >
+                    <div className={`w-5 h-5 rounded-full bg-white shadow transform transition-all ${roomSettings.waitingRoom ? 'translate-x-6' : 'translate-x-0.5'}`} />
+                  </button>
+                </div>
+                
+                {/* Waiting Users List */}
+                {waitingUsers.length > 0 && (
+                  <div className="pt-3 border-t border-zinc-800">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Users className="w-4 h-4 text-yellow-500" />
+                      <span className="text-xs font-bold text-yellow-500 uppercase">Waiting ({waitingUsers.length})</span>
+                    </div>
+                    <div className="space-y-2 max-h-40 overflow-y-auto">
+                      {waitingUsers.map(user => (
+                        <div key={user.odId} className="flex items-center justify-between bg-zinc-800/50 rounded-xl p-2">
+                          <span className="text-sm text-white truncate flex-1">{user.userName}</span>
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => handleAdmitUser(user.odId)}
+                              className="p-1.5 rounded-lg bg-green-500/20 text-green-400 hover:bg-green-500/30 transition-colors"
+                              title="Admit"
+                            >
+                              <Check className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleDenyUser(user.odId)}
+                              className="p-1.5 rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors"
+                              title="Deny"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         <main className="flex-1 w-full h-full relative z-10 flex flex-col">
            {activeStream ? (
@@ -458,6 +672,28 @@ const App = () => {
       {/* Dynamic Grid Background */}
       <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:128px_128px] [mask-image:radial-gradient(ellipse_60%_60%_at_50%_0%,#000_70%,transparent_100%)] pointer-events-none fixed"></div>
       
+      {/* GitHub Source Link - Top Left Corner */}
+      <a 
+        href="https://github.com/AyaanplayszYT/MeshMeet" 
+        target="_blank" 
+        rel="noopener noreferrer"
+        className="fixed top-4 left-4 z-50 flex items-center gap-2 px-3 py-2 rounded-full bg-zinc-900/80 border border-zinc-800 backdrop-blur-md hover:bg-zinc-800 hover:border-zinc-700 transition-all group"
+      >
+        <Github className="w-4 h-4 text-zinc-400 group-hover:text-white transition-colors" />
+        <span className="text-xs font-medium text-zinc-400 group-hover:text-white transition-colors">Source</span>
+      </a>
+
+      {/* Changelog Button - Next to GitHub */}
+      <a 
+        href="https://github.com/AyaanplayszYT/MeshMeet/releases" 
+        target="_blank" 
+        rel="noopener noreferrer"
+        className="fixed top-4 left-[140px] z-50 flex items-center gap-2 px-3 py-2 rounded-full bg-zinc-900/80 border border-zinc-800 backdrop-blur-md hover:bg-zinc-800 hover:border-zinc-700 transition-all group"
+      >
+        <ScrollText className="w-4 h-4 text-zinc-400 group-hover:text-white transition-colors" />
+        <span className="text-xs font-medium text-zinc-400 group-hover:text-white transition-colors">Changelog</span>
+      </a>
+
       <div className="max-w-4xl mx-auto pt-10 relative z-10 space-y-12">
         
         {/* Connection Status Badge */}
@@ -560,6 +796,27 @@ const App = () => {
                             <Globe className="w-4 h-4" /> Public
                          </button>
                      </div>
+
+                     {/* Waiting Room Toggle */}
+                     <label className="flex items-center justify-between p-4 bg-black/50 border border-zinc-800 rounded-xl cursor-pointer hover:border-zinc-700 transition-all">
+                         <div className="flex items-center gap-3">
+                             <DoorOpen className="w-5 h-5 text-zinc-400" />
+                             <div>
+                                 <span className="text-sm font-medium text-white">Waiting Room</span>
+                                 <p className="text-xs text-zinc-500">Approve users before they join</p>
+                             </div>
+                         </div>
+                         <div className="relative">
+                             <input 
+                                 type="checkbox" 
+                                 checked={waitingRoomEnabled} 
+                                 onChange={(e) => setWaitingRoomEnabled(e.target.checked)}
+                                 className="sr-only peer"
+                             />
+                             <div className="w-11 h-6 bg-zinc-700 rounded-full peer peer-checked:bg-blue-600 transition-colors"></div>
+                             <div className="absolute left-0.5 top-0.5 w-5 h-5 bg-white rounded-full shadow-md transform peer-checked:translate-x-5 transition-transform"></div>
+                         </div>
+                     </label>
                  </div>
 
                  <div className="flex gap-3">
